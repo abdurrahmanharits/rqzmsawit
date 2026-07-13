@@ -1,0 +1,9 @@
+streamlit==1.53.1
+geopandas==1.1.1
+fiona==1.10.1
+pyogrio==0.11.1
+shapely==2.1.1
+pandas==2.3.2
+numpy==2.3.2
+plotly==6.5.2
+pydeck==0.9.1
