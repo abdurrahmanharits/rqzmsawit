@@ -7,6 +7,7 @@ berubah atau diganti layer/dataset lain.
 """
 from __future__ import annotations
 
+import sqlite3
 import sys
 import warnings
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from shapely import wkb as shapely_wkb
 from sklearn.preprocessing import StandardScaler
 from scipy.cluster.hierarchy import linkage, fcluster
 
@@ -30,6 +32,42 @@ LAYER_NAME = "joinkarakteristiksawitokta"
 # Kolom bookkeeping generik ala GIS/OGR (bukan variabel domain) — selalu dikecualikan
 # dari pool kandidat, apa pun nama layer/atribut aslinya.
 TECHNICAL_COLS = {"id_blok", "OBJECTID", "JobID", "QLevel", "SHAPE_Leng", "SHAPE_Area", "fid"}
+
+_GPKG_ENVELOPE_SIZES = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}
+
+
+def _parse_gpkg_geometry(blob: bytes):
+    """Decode a GeoPackage Binary (GPB) blob to a shapely geometry.
+
+    Avoids requiring fiona/pyogrio (and their GDAL system dependency) just to
+    read a .gpkg — the format is documented (OGC GeoPackage spec) and is a
+    thin header wrapping a standard WKB geometry.
+    """
+    flags = blob[3]
+    if (flags >> 4) & 0x01:  # empty-geometry flag
+        return None
+    envelope_indicator = (flags >> 1) & 0x07
+    header_len = 8 + _GPKG_ENVELOPE_SIZES.get(envelope_indicator, 0)
+    return shapely_wkb.loads(blob[header_len:])
+
+
+def _read_gpkg_layer(path: str, layer: str):
+    """Read a GeoPackage layer into a GeoDataFrame using stdlib sqlite3 + shapely only."""
+    import geopandas as gpd
+
+    con = sqlite3.connect(path)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT column_name, srs_id FROM gpkg_geometry_columns WHERE table_name=?", (layer,))
+        geom_col, srs_id = cur.fetchone()
+        cur.execute("SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id=?", (srs_id,))
+        crs_wkt = cur.fetchone()[0]
+        df = pd.read_sql_query(f'SELECT * FROM "{layer}"', con)
+    finally:
+        con.close()
+
+    geoms = df[geom_col].apply(_parse_gpkg_geometry)
+    return gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geoms, crs=crs_wkt)
 
 
 def detect_numeric_columns(df: pd.DataFrame, min_numeric_frac: float = 0.5) -> list[str]:
@@ -64,7 +102,7 @@ def load_data(path: str, layer: str) -> tuple[pd.DataFrame, dict, tuple[float, f
     except Exception as exc:
         return pd.DataFrame(), {}, (111.4, -0.05), f"geopandas belum terpasang: {exc}"
 
-    gdf = gpd.read_file(p, layer=layer)
+    gdf = _read_gpkg_layer(str(p), layer)
     gdf["id_blok"] = np.arange(len(gdf))  # kunci join ke geojson feature id
 
     centroid_proj = gdf.geometry.centroid  # dihitung di CRS proyeksi (UTM) sebelum reproject
