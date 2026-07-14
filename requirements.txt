@@ -7,3 +7,4 @@ plotly>=6.0
 pydeck>=0.9
 scikit-learn>=1.4
 scipy>=1.11
+libpysal>=4.9
