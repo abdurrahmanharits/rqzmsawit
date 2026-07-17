@@ -1,18 +1,23 @@
-"""Dashboard Kebun Sawit — sumber data: db/data-okta.gpkg.
+"""Dashboard Kebun Sawit — sumber data: db/data-okta.gpkg atau upload custom.
 
 Semua kolom kategori/numerik untuk filter, peta, dan pembentukan zona RQZM
 dideteksi otomatis dari skema layer yang sedang dibuka (bukan nama kolom
 yang di-hardcode), supaya halaman ini tetap berfungsi walau skema gpkg
 berubah atau diganti layer/dataset lain.
+
+Fitur: Upload ZIP (shapefile) atau Geopackage (.gpkg) custom.
 """
 from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import warnings
+import zipfile
 from collections import deque
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -122,6 +127,111 @@ def load_data(path: str, layer: str) -> tuple[pd.DataFrame, dict, tuple[float, f
     for c in detect_numeric_columns(df):  # kolom numerik gpkg bisa datang sebagai String (mis. YOP)
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df, geojson_obj, center, ""
+
+
+def _extract_zipfile(zip_bytes: bytes, extract_dir: Path) -> None:
+    """Extract ZIP file (shapefile package) ke temporary directory."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
+        tmp_zip.write(zip_bytes)
+        tmp_zip_path = tmp_zip.name
+    
+    with zipfile.ZipFile(tmp_zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+    
+    Path(tmp_zip_path).unlink()
+
+
+def _get_shapefile_layers(zip_or_dir: Path) -> list[str]:
+    """Dapatkan daftar shapefile (.shp) dalam directory."""
+    if zip_or_dir.is_dir():
+        shp_files = list(zip_or_dir.glob("*.shp"))
+        return [f.stem for f in shp_files]
+    return []
+
+
+def _get_gpkg_layers(gpkg_path: Path) -> list[str]:
+    """Dapatkan daftar layer dalam GeoPackage."""
+    try:
+        con = sqlite3.connect(str(gpkg_path))
+        cur = con.cursor()
+        cur.execute("SELECT table_name FROM gpkg_contents WHERE data_type='features'")
+        layers = [row[0] for row in cur.fetchall()]
+        con.close()
+        return layers
+    except Exception:
+        return []
+
+
+def load_data_from_upload(
+    file_bytes: bytes, filename: str, selected_layer: str | None = None
+) -> tuple[pd.DataFrame, dict, tuple[float, float], str, str]:
+    """
+    Baca data dari uploaded file (ZIP shapefile atau GPKG).
+    
+    Returns:
+        (df, geojson_obj, center, error_msg, actual_layer_used)
+    """
+    try:
+        if filename.lower().endswith(".zip"):
+            extract_dir = Path(tempfile.mkdtemp(prefix="shapefile_"))
+            _extract_zipfile(file_bytes, extract_dir)
+            layers = _get_shapefile_layers(extract_dir)
+            
+            if not layers:
+                return pd.DataFrame(), {}, (0, 0), "Tidak ada file .shp dalam ZIP", ""
+            
+            layer_to_use = selected_layer if selected_layer in layers else layers[0]
+            shp_path = extract_dir / f"{layer_to_use}.shp"
+            
+            gdf = gpd.read_file(str(shp_path))
+        
+        elif filename.lower().endswith(".gpkg"):
+            tmp_gpkg = Path(tempfile.mkdtemp(prefix="gpkg_")) / filename
+            tmp_gpkg.write_bytes(file_bytes)
+            
+            layers = _get_gpkg_layers(tmp_gpkg)
+            if not layers:
+                return pd.DataFrame(), {}, (0, 0), "Tidak ada layer dalam GPKG", ""
+            
+            layer_to_use = selected_layer if selected_layer in layers else layers[0]
+            gdf = gpd.read_file(str(tmp_gpkg), layer=layer_to_use)
+        
+        else:
+            return pd.DataFrame(), {}, (0, 0), "Format file harus .zip (shapefile) atau .gpkg", ""
+        
+        if gdf.empty:
+            return pd.DataFrame(), {}, (0, 0), "GeoDataFrame kosong", layer_to_use
+        
+        if gdf.geometry is None or gdf.geometry.empty:
+            return pd.DataFrame(), {}, (0, 0), "Tidak ada geometry column", layer_to_use
+        
+        gdf = gdf.reset_index(drop=True)
+        gdf["id_blok"] = np.arange(len(gdf))
+        
+        centroid_proj = gdf.geometry.centroid
+        try:
+            center_point = gpd.GeoSeries(centroid_proj, crs=gdf.crs).to_crs(4326)
+            center = (float(center_point.x.mean()), float(center_point.y.mean()))
+        except Exception:
+            center = (0, 0)
+        
+        try:
+            gdf_ll = gdf.to_crs(4326)
+        except Exception:
+            gdf_ll = gdf
+        geojson_obj = gdf_ll.__geo_interface__
+        
+        df = pd.DataFrame(gdf.drop(columns="geometry"))
+        df["_x_utm"] = centroid_proj.x.to_numpy()
+        df["_y_utm"] = centroid_proj.y.to_numpy()
+        
+        for c in detect_numeric_columns(df):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        
+        return df, geojson_obj, center, "", layer_to_use
+    
+    except Exception as e:
+        return pd.DataFrame(), {}, (0, 0), f"Error membaca file: {str(e)}", ""
 
 
 # =============================================================================
@@ -291,11 +401,68 @@ st.set_page_config(page_title="Kebun Sawit — OKTA", layout="wide")
 render_sidebar(__file__)
 
 st.title("🌴 Dashboard RQZM-Sawit")
-st.caption(f"Sumber: `db/data-okta.gpkg` — layer `{LAYER_NAME}`.")
 
-df, geojson_obj, map_center, err = load_data(str(GPKG_PATH), LAYER_NAME)
-if err:
-    st.warning(err)
+# ---- Pilihan Sumber Data (Sidebar) ---- #
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📊 Sumber Data")
+data_source = st.sidebar.radio("Pilih sumber data:", ["File Bawaan (data-okta.gpkg)", "Upload Custom (ZIP/GPKG)"])
+
+if data_source == "File Bawaan (data-okta.gpkg)":
+    st.caption(f"Sumber: `db/data-okta.gpkg` — layer `{LAYER_NAME}`.")
+    df, geojson_obj, map_center, err = load_data(str(GPKG_PATH), LAYER_NAME)
+    source_info = "File Bawaan"
+
+else:
+    st.sidebar.markdown("**Upload File Spatial**")
+    st.sidebar.caption("Format: `.zip` (shapefile) atau `.gpkg` (GeoPackage)")
+    
+    uploaded_file = st.sidebar.file_uploader(
+        "Pilih file:",
+        type=["zip", "gpkg"],
+        help="ZIP harus berisi file shapefile (.shp, .shx, .dbf, dll). GPKG bisa satu atau multiple layer."
+    )
+    
+    if uploaded_file is not None:
+        st.sidebar.info(f"✓ File dipilih: `{uploaded_file.name}`")
+        
+        file_bytes = uploaded_file.read()
+        
+        # Deteksi layer
+        if uploaded_file.name.lower().endswith(".zip"):
+            extract_dir = Path(tempfile.mkdtemp(prefix="shapefile_"))
+            _extract_zipfile(file_bytes, extract_dir)
+            layers = _get_shapefile_layers(extract_dir)
+        else:  # .gpkg
+            tmp_gpkg = Path(tempfile.mkdtemp(prefix="gpkg_")) / uploaded_file.name
+            tmp_gpkg.write_bytes(file_bytes)
+            layers = _get_gpkg_layers(tmp_gpkg)
+        
+        if layers:
+            selected_layer = st.sidebar.selectbox("Pilih layer:", layers, index=0)
+        else:
+            st.sidebar.warning("Tidak ada layer ditemukan dalam file.")
+            selected_layer = None
+        
+        if st.sidebar.button("🚀 Proses", use_container_width=True):
+            with st.spinner("Memproses file..."):
+                df, geojson_obj, map_center, err, actual_layer = load_data_from_upload(
+                    file_bytes, uploaded_file.name, selected_layer
+                )
+                if err:
+                    st.error(f"❌ {err}")
+                    st.stop()
+                else:
+                    st.sidebar.success(f"✓ Berhasil dimuat! Layer: {actual_layer}")
+                    source_info = f"Upload Custom: {uploaded_file.name}"
+        else:
+            st.info("👈 Klik tombol **Proses** untuk memuat data.")
+            st.stop()
+    else:
+        st.info("👈 Pilih file untuk diupload.")
+        st.stop()
+
+if df.empty:
+    st.error("Data kosong atau tidak valid. Periksa kembali sumber data Anda.")
     st.stop()
 
 numeric_candidates = detect_numeric_columns(df)
