@@ -237,16 +237,78 @@ def load_data_from_upload(
 # =============================================================================
 # Kontiguitas spasial (RQZM-II) — bobot tetangga, sliver merge, diagnostik.
 # =============================================================================
-def _build_spatial_weights(coords: np.ndarray, knn_k: int = 5):
-    """KNN weights: dipakai untuk struktur ketetanggaan, diagnostik, dan merge sliver."""
+def _build_spatial_weights(coords: np.ndarray | None = None, geojson_obj: dict | None = None, knn_k: int = 5, neighbor_type: str = "KNN"):
+    """Build spatial weights based on requested neighbor_type.
+
+    Supported neighbor_type:
+    - 'KNN' (default): K-nearest neighbors using coordinates
+    - 'rook': polygon edge contiguity
+    - 'queen': polygon edge+corner contiguity
+    - 'bishop': corner-only contiguity (queen minus rook)
+
+    Returns a libpysal.weights.W object or None if unavailable.
+    """
     try:
         import libpysal
     except Exception:
         return None
-    if len(coords) < 2:
+
+    nt = (neighbor_type or "KNN").lower()
+
+    if nt == "knn":
+        if coords is None or len(coords) < 2:
+            return None
+        k_use = min(max(1, int(knn_k)), len(coords) - 1)
+        w = libpysal.weights.KNN.from_array(coords, k=k_use, silence_warnings=True)
+        w.transform = "R"
+        return w
+
+    # Contiguity-based weights require polygon geometries available via geojson_obj
+    if geojson_obj is None:
         return None
-    k_use = min(max(1, int(knn_k)), len(coords) - 1)
-    w = libpysal.weights.KNN.from_array(coords, k=k_use, silence_warnings=True)
+
+    try:
+        import geopandas as gpd
+    except Exception:
+        return None
+
+    # build geometries from geojson features
+    from shapely.geometry import shape
+
+    try:
+        geoms = [shape(f.get("geometry")) for f in geojson_obj.get("features", [])]
+    except Exception:
+        return None
+
+    if len(geoms) < 2:
+        return None
+
+    gdf = gpd.GeoDataFrame(geometry=geoms, crs="EPSG:4326")
+
+    try:
+        if nt == "rook":
+            w = libpysal.weights.Rook.from_dataframe(gdf, silence_warnings=True)
+        elif nt == "queen":
+            w = libpysal.weights.Queen.from_dataframe(gdf, silence_warnings=True)
+        elif nt == "bishop":
+            wq = libpysal.weights.Queen.from_dataframe(gdf, silence_warnings=True)
+            wr = libpysal.weights.Rook.from_dataframe(gdf, silence_warnings=True)
+            neighbors = {}
+            for i, neigh in wq.neighbors.items():
+                rset = set(wr.neighbors.get(i, []))
+                b = [nb for nb in neigh if nb not in rset]
+                neighbors[int(i)] = [int(x) for x in b]
+            # ensure symmetric neighbors
+            for i, neigh in list(neighbors.items()):
+                for nb in neigh:
+                    if i not in neighbors.get(nb, []):
+                        neighbors[nb] = neighbors.get(nb, []) + [i]
+            w = libpysal.weights.W(neighbors)
+        else:
+            return None
+    except Exception:
+        return None
+
     w.transform = "R"
     return w
 
@@ -571,7 +633,37 @@ else:
     st.markdown("**Bobot Kontiguitas Spasial (β) & Struktur Ketetanggaan**")
     st.caption("β = 0 setara Non-Contiguous; β makin besar = lokasi makin menarik tetangga ke zona yang sama.")
     beta = st.select_slider("Bobot kontiguitas β", options=[0.0, 0.25, 0.5, 1.0, 1.5, 2.0], value=0.5)
-    knn_k = st.slider("Tetangga KNN (struktur kontiguitas & diagnostik)", min_value=3, max_value=10, value=5, step=1)
+    neighbor_choice = st.selectbox(
+        "Tipe ketetanggaan (struktur kontiguitas & diagnostik)",
+        options=[
+            "KNN (point-KNN)",
+            "Rook (edge)",
+            "Queen (edge+corner)",
+            "Bishop (corner-only)",
+        ],
+        index=0,
+        help=(
+            "KNN: k tetangga terdekat berdasar jarak koordinat blok. "
+            "Rook: poligon blok bertetangga jika bersinggungan sisi (edge). "
+            "Queen: bersinggungan sisi ATAU sudut (edge+corner). "
+            "Bishop: hanya bersinggungan sudut saja (corner-only, queen minus rook)."
+        ),
+    )
+    # Map human labels to internal short codes
+    if neighbor_choice.startswith("KNN"):
+        neighbor_type = "knn"
+    elif neighbor_choice.startswith("Rook"):
+        neighbor_type = "rook"
+    elif neighbor_choice.startswith("Queen"):
+        neighbor_type = "queen"
+    else:
+        neighbor_type = "bishop"
+
+    # KNN parameter only relevant when KNN selected
+    if neighbor_type == "knn":
+        knn_k = st.slider("Tetangga KNN (struktur kontiguitas & diagnostik)", min_value=3, max_value=10, value=5, step=1)
+    else:
+        knn_k = 5
 
     st.markdown("**Pembersihan Sliver (pasca-hoc, opsional)**")
     do_merge = st.checkbox("Gabungkan sliver spasial kecil ke zona tetangga ber-atribut terdekat", value=True)
@@ -592,9 +684,16 @@ else:
         work[xy_cols] = StandardScaler().fit_transform(work[["_x_utm", "_y_utm"]].to_numpy(dtype=float))
 
         coords = work[["_x_utm", "_y_utm"]].to_numpy(dtype=float)
-        w_knn = _build_spatial_weights(coords, knn_k=int(knn_k))
+        w_knn = _build_spatial_weights(coords, geojson_obj=geojson_obj, knn_k=int(knn_k), neighbor_type=neighbor_type)
         if w_knn is None:
-            st.info("libpysal belum terpasang: diagnostik kontiguitas & sliver-merge dilewati (zonasi tetap jalan).")
+            if neighbor_type != "knn":
+                st.info(
+                    f"Bobot tetangga '{neighbor_choice}' tidak dapat dibentuk (libpysal belum terpasang, "
+                    "geometri blok tidak tersedia, atau geometri tidak valid): diagnostik kontiguitas & "
+                    "sliver-merge dilewati (zonasi tetap jalan)."
+                )
+            else:
+                st.info("libpysal belum terpasang: diagnostik kontiguitas & sliver-merge dilewati (zonasi tetap jalan).")
 
         # ---- Sweep β (langkah pendefinisi kontiguitas RQZM-II) ---- #
         st.markdown("### Pemilihan β")
@@ -654,8 +753,8 @@ else:
             work["zona"] = work["cluster_raw"].astype(int)
 
         st.caption(
-            f"Fitur zona: [{', '.join(rqzm_vars)} | β×koordinat blok] dengan β={beta:g}. "
-            f"Merge sliver: {'ON' if do_merge else 'OFF'}."
+            f"Fitur zona: [{', '.join(rqzm_vars)} | β×koordinat blok] dengan β={beta:g}, "
+            f"tipe ketetanggaan={neighbor_choice}. Merge sliver: {'ON' if do_merge else 'OFF'}."
         )
 
         counts = work.groupby("zona").size().rename("n").reset_index()
@@ -734,6 +833,6 @@ else:
         st.download_button(
             "Download CSV (hasil zonasi RQZM)",
             data=work[dl_cols].to_csv(index=False).encode("utf-8"),
-            file_name=f"okta_rqzm_zona_k{k}_b{beta:g}.csv",
+            file_name=f"okta_rqzm_zona_k{k}_b{beta:g}_{neighbor_type.lower()}.csv",
             mime="text/csv",
         )
