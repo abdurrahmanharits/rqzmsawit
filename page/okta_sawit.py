@@ -1,8 +1,8 @@
-"""Dashboard Kebun Sawit — sumber data: db/data-okta.gpkg atau upload custom.
+"""Dashboard Kebun Sawit — sumber data: db/join-karakteristik-sawit-okta.shp atau upload custom.
 
 Semua kolom kategori/numerik untuk filter, peta, dan pembentukan zona RQZM
 dideteksi otomatis dari skema layer yang sedang dibuka (bukan nama kolom
-yang di-hardcode), supaya halaman ini tetap berfungsi walau skema gpkg
+yang di-hardcode), supaya halaman ini tetap berfungsi walau skema data
 berubah atau diganti layer/dataset lain.
 
 Fitur: Upload ZIP (shapefile) atau Geopackage (.gpkg) custom.
@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from shapely import wkb as shapely_wkb
 from sklearn.preprocessing import StandardScaler
 from scipy.cluster.hierarchy import linkage, fcluster
 
@@ -32,51 +31,14 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from nav import render_sidebar
 
 ROOT = Path(__file__).resolve().parents[1]
-GPKG_PATH = ROOT / "db" / "data-okta.gpkg"
-LAYER_NAME = "joinkarakteristiksawitokta"
+SHP_PATH = ROOT / "db" / "join-karakteristik-sawit-okta.shp"
 
 # Kolom bookkeeping generik ala GIS/OGR (bukan variabel domain) — selalu dikecualikan
 # dari pool kandidat, apa pun nama layer/atribut aslinya.
 TECHNICAL_COLS = {
     "id_blok", "OBJECTID", "JobID", "QLevel", "SHAPE_Leng", "SHAPE_Area", "fid",
-    "_x_utm", "_y_utm",  # centroid blok (CRS proyeksi asli gpkg) — dipakai suku kontiguitas RQZM
+    "_x_utm", "_y_utm",  # centroid blok (CRS proyeksi asli data) — dipakai suku kontiguitas RQZM
 }
-
-_GPKG_ENVELOPE_SIZES = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}
-
-
-def _parse_gpkg_geometry(blob: bytes):
-    """Decode a GeoPackage Binary (GPB) blob to a shapely geometry.
-
-    Avoids requiring fiona/pyogrio (and their GDAL system dependency) just to
-    read a .gpkg — the format is documented (OGC GeoPackage spec) and is a
-    thin header wrapping a standard WKB geometry.
-    """
-    flags = blob[3]
-    if (flags >> 4) & 0x01:  # empty-geometry flag
-        return None
-    envelope_indicator = (flags >> 1) & 0x07
-    header_len = 8 + _GPKG_ENVELOPE_SIZES.get(envelope_indicator, 0)
-    return shapely_wkb.loads(blob[header_len:])
-
-
-def _read_gpkg_layer(path: str, layer: str):
-    """Read a GeoPackage layer into a GeoDataFrame using stdlib sqlite3 + shapely only."""
-    import geopandas as gpd
-
-    con = sqlite3.connect(path)
-    try:
-        cur = con.cursor()
-        cur.execute("SELECT column_name, srs_id FROM gpkg_geometry_columns WHERE table_name=?", (layer,))
-        geom_col, srs_id = cur.fetchone()
-        cur.execute("SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id=?", (srs_id,))
-        crs_wkt = cur.fetchone()[0]
-        df = pd.read_sql_query(f'SELECT * FROM "{layer}"', con)
-    finally:
-        con.close()
-
-    geoms = df[geom_col].apply(_parse_gpkg_geometry)
-    return gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geoms, crs=crs_wkt)
 
 
 def detect_numeric_columns(df: pd.DataFrame, min_numeric_frac: float = 0.5) -> list[str]:
@@ -101,8 +63,8 @@ def detect_categorical_columns(df: pd.DataFrame, min_unique: int = 2, max_unique
     return cols
 
 
-@st.cache_data(show_spinner="Memuat data-okta.gpkg...")
-def load_data(path: str, layer: str) -> tuple[pd.DataFrame, dict, tuple[float, float], str]:
+@st.cache_data(show_spinner="Memuat join-karakteristik-sawit-okta.shp...")
+def load_data(path: str) -> tuple[pd.DataFrame, dict, tuple[float, float], str]:
     p = Path(path)
     if not p.exists():
         return pd.DataFrame(), {}, (111.4, -0.05), f"File tidak ditemukan: {p}"
@@ -111,7 +73,7 @@ def load_data(path: str, layer: str) -> tuple[pd.DataFrame, dict, tuple[float, f
     except Exception as exc:
         return pd.DataFrame(), {}, (111.4, -0.05), f"geopandas belum terpasang: {exc}"
 
-    gdf = _read_gpkg_layer(str(p), layer)
+    gdf = gpd.read_file(str(p))
     gdf["id_blok"] = np.arange(len(gdf))  # kunci join ke geojson feature id
 
     centroid_proj = gdf.geometry.centroid  # dihitung di CRS proyeksi (UTM) sebelum reproject
@@ -467,11 +429,11 @@ st.title("🌴 Dashboard RQZM-Sawit")
 # ---- Pilihan Sumber Data (Sidebar) ---- #
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 Sumber Data")
-data_source = st.sidebar.radio("Pilih sumber data:", ["File Bawaan (data-okta.gpkg)", "Upload Custom (ZIP/GPKG)"])
+data_source = st.sidebar.radio("Pilih sumber data:", ["File Bawaan (join-karakteristik-sawit-okta.shp)", "Upload Custom (ZIP/GPKG)"])
 
-if data_source == "File Bawaan (data-okta.gpkg)":
-    st.caption(f"Sumber: `db/data-okta.gpkg` — layer `{LAYER_NAME}`.")
-    df, geojson_obj, map_center, err = load_data(str(GPKG_PATH), LAYER_NAME)
+if data_source == "File Bawaan (join-karakteristik-sawit-okta.shp)":
+    st.caption(f"Sumber: `db/{SHP_PATH.name}`.")
+    df, geojson_obj, map_center, err = load_data(str(SHP_PATH))
     source_info = "File Bawaan"
 
 else:
@@ -628,7 +590,7 @@ if len(rqzm_vars) < 2:
 else:
     st.markdown("**Pengaturan Jumlah Zona**")
     k = st.slider("Number of zones (k)", min_value=2, max_value=8, value=3, step=1)
-    st.caption(f"Zona dihitung dari `{LAYER_NAME}` ({len(rqzm_vars)} variabel terstandardisasi + suku kontiguitas).")
+    st.caption(f"Zona dihitung dari `{SHP_PATH.name}` ({len(rqzm_vars)} variabel terstandardisasi + suku kontiguitas).")
 
     st.markdown("**Bobot Kontiguitas Spasial (β) & Struktur Ketetanggaan**")
     st.caption("β = 0 setara Non-Contiguous; β makin besar = lokasi makin menarik tetangga ke zona yang sama.")
